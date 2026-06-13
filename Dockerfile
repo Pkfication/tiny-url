@@ -1,9 +1,10 @@
 FROM golang:latest
 
 WORKDIR /app
-COPY go.mod ./
+COPY go.mod go.sum* ./
+RUN go mod download
 COPY . .
-RUN go mod tidy
-RUN go build -o main ./cmd/kgs
+ARG SERVICE_NAME=kgs
+RUN go build -o main ./cmd/${SERVICE_NAME}
 
 CMD ["./main"]
