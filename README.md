@@ -1,11 +1,40 @@
-# TinyURL - Distributed Key Generation Service (KGS)
+# TinyURL - Distributed URL Shortening System
 
-This repository contains the implementation and experimentation details for a highly scalable, distributed Key Generation Service (KGS) for a TinyURL clone. The service generates unique, collision-free short URLs (Base62 strings) and is designed to handle extreme concurrency.
+This repository contains a highly scalable, distributed URL Shortening service built with Golang. It consists of three primary services:
+1. **Key Generation Service (KGS)**: Generates unique, collision-free short URL keys (Base62 strings) using Apache ZooKeeper.
+2. **Write Service (`write-service`)**: Fetches keys from KGS, stores key-to-URL mappings in Redis, and returns the shortened link.
+3. **Read Service (`read-service`)**: Exposes short URL keys, resolves them in Redis, and redirects users to the original destination.
+
+The system is designed to handle extreme concurrency and includes end-to-end performance optimizations and distributed tracing.
 
 ## Architecture Overview
 
+```mermaid
+graph TD
+    User([User Client]) --> Gateway[Nginx API Gateway]
+    
+    %% Nginx Routing
+    Gateway -- "GET /key" --> KGS[KGS Nodes]
+    Gateway -- "POST /shorten" --> WriteSvc[Write Service]
+    Gateway -- "GET /:key (fallback)" --> ReadSvc[Read Service]
+    
+    %% Key Generation & Storage
+    KGS -- "Range Coordination" --> ZK[Apache ZooKeeper]
+    WriteSvc -- "Fetch Keys" --> KGS
+    WriteSvc -- "Write Mapping" --> Redis[(Redis Database)]
+    ReadSvc -- "Read Mapping" --> Redis
+    
+    %% APM Tracing
+    KGS --> APM[APM Server]
+    WriteSvc --> APM
+    ReadSvc --> APM
+    APM --> ES[(Elasticsearch)]
+    Kibana[Kibana UI] --> ES
+```
+
 *   **Language**: Golang
 *   **Coordination**: Apache ZooKeeper
+*   **Storage**: Redis (Persistent Key-Value Store)
 *   **Load Balancing**: Nginx API Gateway
 *   **Observability**: Elastic Stack (Elasticsearch, Kibana, APM Server)
 *   **Containerization**: Docker & Docker Compose
@@ -14,49 +43,29 @@ This repository contains the implementation and experimentation details for a hi
 To ensure absolutely no key collisions across horizontally scaled instances, the KGS uses **Apache ZooKeeper**. 
 Instead of hitting ZooKeeper for every single key request, each KGS instance claims a large, mutually exclusive "block" or "range" of keys at a time. The instance dispenses these keys from local memory. Once an instance exhausts its range, it goes back to ZooKeeper to fetch a new block.
 
-### 2. High-Performance Load Balancing & Autoscaling
-We use an **Nginx API Gateway** as the single entry point (`http://localhost:8080/key`).
+### 2. URL Shortening (Write Service)
+The `write-service` exposes a `POST /shorten` endpoint. When called:
+1. It requests a new unique key from the KGS cluster directly.
+2. It saves the key and long URL as a key-value pair in Redis.
+3. It returns the shortened URL: `http://localhost:8080/<key>`.
 
-We experimented with dynamic autoscaling by setting Nginx to use Docker's internal DNS resolver (`127.0.0.11`). Because Nginx typically caches DNS resolutions at startup, we configured it dynamically:
-```nginx
-resolver 127.0.0.11 valid=5s;
-location /key {
-    set $upstream http://kgs:8080;
-    proxy_pass $upstream/key;
-}
-```
-This allows us to seamlessly scale the KGS instances up and down using:
-`docker-compose up -d --scale kgs=10`
-Nginx detects the new containers within 5 seconds and instantly begins routing traffic to them without needing a restart.
-
-*(Note: We initially experimented with Traefik for dynamic service discovery, but reverted to Nginx due to stubborn `/var/run/docker.sock` permission restrictions on Docker Desktop for Mac).*
-
-### 3. Observability & APM
-The cluster includes a local Elastic Stack (version 7.17.13 to support standalone APM without Fleet integration complexity). The Go KGS service is heavily instrumented using Elastic's Go APM Agent. 
-Every HTTP request to the `/key` endpoint generates a distributed trace, allowing us to monitor latency, throughput, and error rates via Kibana (`http://localhost:5601`).
+### 3. URL Redirection (Read Service)
+The `read-service` acts as a wildcard handler at the root path (`/`). When called with a short key:
+1. It extracts the key from the path.
+2. It queries Redis for the associated original URL.
+3. If found, it redirects the client with an HTTP `302 Found` status. If not, it returns `404 Not Found`.
 
 ---
 
 ## Load Testing & Performance Tuning (Target: 1M TPM)
 
-We conducted rigorous stress testing using Apache Bench (`ab`) running concurrently across 12 terminal windows. Our goal was to achieve **1,000,000 Transactions Per Minute (TPM)**, which translates to roughly **16,666 Requests Per Second (RPS)**.
+We conducted stress testing using Apache Bench (`ab`) running concurrently across 12 terminal windows. Our goal was to achieve **1,000,000 Transactions Per Minute (TPM)**, roughly **16,666 Requests Per Second (RPS)**.
 
-During the load testing, we identified and eliminated several major bottlenecks:
-
-#### Bottleneck 1: Zookeeper Network IO
-Initially, the `rangeSize` claimed by each server was `1,000`. At 16K RPS, the KGS instances were synchronously pausing to fetch a new block from ZooKeeper 16 times a second. This caused massive IO blocking.
-*   **Fix**: We increased the `rangeSize` to `100,000`. This completely eliminated the ZooKeeper bottleneck, as each container now only needs to talk to ZooKeeper once every ~6 seconds.
-
-#### Bottleneck 2: Nginx Connection Limits
-The default Nginx `worker_connections` is capped at `1024`. Our load testing (`ab -c 500` x 12 terminals) generated 6,000 concurrent connections, immediately saturating the gateway.
-*   **Fix**: We increased `worker_connections` to `10240`.
-
-#### Bottleneck 3: TCP Handshake Overhead
-Nginx was establishing a brand new TCP connection with the backend Go containers for every single proxy request. At 16K RPS, the TCP handshake overhead was severely throttling throughput.
-*   **Fix**: We configured an Nginx `upstream` block with a `keepalive 500` setting to maintain 500 idle connections. We also enforced `proxy_http_version 1.1` and stripped the `Connection` header so Nginx successfully reuses connections to the backends.
-
-#### Bottleneck 4: APM Tracing Overhead
-Generating and indexing 16,666 distributed traces per second into a local Elasticsearch container quickly becomes a CPU and disk bottleneck. For extreme local load testing, APM tracing should either be temporarily disabled (`ELASTIC_APM_ACTIVE=false`) or aggressively sampled.
+Major bottlenecks resolved:
+*   **ZooKeeper Network IO**: Solved by setting `rangeSize` to `100,000`. KGS only calls ZooKeeper once every ~6 seconds at 16K RPS.
+*   **Nginx Connection Limits**: Increased `worker_connections` from 1024 to 10240.
+*   **TCP Handshake Overhead**: Configured keepalive upstreams (`keepalive 500`) and configured HTTP 1.1 keep-alives in Nginx proxying rules.
+*   **APM Sampling**: Aggressively sampled APM traces under high load to prevent Elasticsearch CPU and disk bottlenecks.
 
 ---
 
@@ -66,16 +75,22 @@ Generating and indexing 16,666 distributed traces per second into a local Elasti
     ```bash
     docker-compose up -d --build --scale kgs=3
     ```
-2.  **Generate a Key**:
+
+2.  **Shorten a URL**:
     ```bash
-    curl http://localhost:8080/key
+    curl -X POST -H "Content-Type: application/json" -d '{"url":"https://google.com"}' http://localhost:8080/shorten
     ```
-3.  **Scale the Cluster dynamically**:
+    *Expected output*: `{"tiny_url":"http://localhost:8080/0"}`
+
+3.  **Resolve / Redirect a URL**:
     ```bash
-    docker-compose up -d --scale kgs=10
+    curl -i http://localhost:8080/0
     ```
+    *Expected output*: `HTTP/1.1 302 Found` with `Location: https://google.com`.
+
 4.  **View Traces in Kibana**:
-    Navigate to `http://localhost:5601` -> Observability -> APM.
+    Open `http://localhost:5601` -> Observability -> APM to view end-to-end distributed traces crossing `nginx` $\rightarrow$ `write-service` $\rightarrow$ `kgs`.
+
 5.  **Stop the Cluster**:
     ```bash
     docker-compose down
